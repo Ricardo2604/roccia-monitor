@@ -1,0 +1,25 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <rect width="512" height="512" fill="#0A0E15"/>
+
+  <!-- Cuerpo del power bank (zona segura maskable: centro 80%) -->
+  <rect x="151" y="76" width="210" height="360" rx="42" fill="#161D29" stroke="#26303F" stroke-width="8"/>
+  <rect x="151" y="76" width="210" height="360" rx="42" fill="none" stroke="#3A4657" stroke-width="2" opacity="0.6"/>
+
+  <!-- Puertos USB superiores -->
+  <rect x="188" y="108" width="58" height="22" rx="6" fill="#0A0E15" stroke="#26303F" stroke-width="3"/>
+  <rect x="200" y="115" width="34" height="8" rx="2" fill="#26303F"/>
+  <rect x="266" y="108" width="58" height="22" rx="6" fill="#0A0E15" stroke="#26303F" stroke-width="3"/>
+  <rect x="278" y="115" width="34" height="8" rx="2" fill="#26303F"/>
+
+  <!-- Display LCD -->
+  <rect x="183" y="158" width="146" height="110" rx="14" fill="#0A0E15" stroke="#26303F" stroke-width="4"/>
+  <text x="256" y="230" font-family="DejaVu Sans Mono, monospace" font-size="64" font-weight="bold" fill="#5DCAA5" text-anchor="middle">100</text>
+  <rect x="199" y="242" width="114" height="8" rx="4" fill="#1A2230"/>
+  <rect x="199" y="242" width="114" height="8" rx="4" fill="#5DCAA5"/>
+
+  <!-- Rayo (energía) -->
+  <path d="M 272 292 L 226 366 L 252 366 L 240 420 L 288 340 L 260 340 Z" fill="#5DCAA5"/>
+
+  <!-- Botón lateral de encendido -->
+  <rect x="146" y="200" width="10" height="52" rx="5" fill="#26303F"/>
+</svg>
