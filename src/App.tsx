@@ -1,4 +1,16 @@
 import { useEffect, useRef, useState } from "react";
+import {
+  enqueueEvent,
+  loadHogar,
+  outboxLength,
+  runSyncCycle,
+  setupHogarExistente,
+  setupHogarNuevo,
+  subscribeRealtime,
+  supabase,
+  type HogarConfig,
+  type SyncEvent,
+} from "./sync";
 
 /* ================= CONFIGURACIÓN Y PERSISTENCIA ================= */
 
@@ -29,6 +41,7 @@ type Calibration = {
   realPercent: number;
   deviation: number; // estimado - real (+ = app optimista / adelantada)
   newConstant: number;
+  remoto?: boolean; // true = llegó como evento sincronizado de otro teléfono
 };
 
 type Session = {
@@ -58,11 +71,15 @@ type CalibrationLogEntry = {
   minutosDelTramo: number;
   constanteMedida: number;
   tipo: "manual" | "cierre";
+  origenDeviceId?: string; // presente cuando la medición llegó de otro teléfono
 };
 
 // Corrección de "dígito recién cambiado": el display del power bank solo
 // muestra enteros, así que el valor real puede estar hasta 0.99 por debajo.
 type DigitMode = "none" | "just_changed" | "unknown";
+
+// Estado del indicador de sincronización (Mejora Supabase, punto 4).
+type SyncStatus = { kind: "local" } | { kind: "pending"; count: number } | { kind: "synced"; at: number };
 
 function loadSession(): Session | null {
   try {
@@ -159,6 +176,15 @@ function tramoIndexForPercent(p: number): number {
   if (p > 70) return 1;
   if (p > 40) return 2;
   return 3;
+}
+
+function tramoLabelForPercent(p: number): string {
+  const [hi, lo] = TRAMOS[tramoIndexForPercent(p)];
+  return `${hi}-${lo}`;
+}
+function findTramoRangeByLabel(label: string): [number, number] {
+  const found = TRAMOS.find((r) => `${r[0]}-${r[1]}` === label);
+  return found ?? TRAMOS[TRAMOS.length - 1];
 }
 
 /* Media ponderada de las mediciones que caen en el tramo: peso = minutos del
@@ -532,6 +558,14 @@ export default function App() {
   const [stopCorrectInput, setStopCorrectInput] = useState("");
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
+  // Sincronización multi-dispositivo (Supabase). Sin código de hogar, la app
+  // funciona exactamente igual que en modo solo local.
+  const [hogar, setHogar] = useState<HogarConfig | null>(() => loadHogar());
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(() =>
+    loadHogar() ? { kind: "pending", count: outboxLength() } : { kind: "local" }
+  );
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+
   // Banner de instalación: "prompt" = hay beforeinstallprompt disponible,
   // "manual" = fallback (Safari iOS y otros navegadores que no lo disparan).
   const [installBanner, setInstallBanner] = useState<{ mode: "prompt" | "manual" } | null>(null);
@@ -574,6 +608,39 @@ export default function App() {
     };
   }, []);
 
+  // Sincronización: al abrir la app (si hay hogar), suscripción Realtime al
+  // canal del hogar, y reintento al recuperar conexión. Todo silencioso.
+  useEffect(() => {
+    if (!hogar) {
+      setSyncStatus({ kind: "local" });
+      return;
+    }
+    void triggerSync();
+
+    const unsubscribe = subscribeRealtime(hogar, (event) => {
+      applyRemoteEvents([event]);
+      void triggerSync();
+    });
+    function handleOnline() {
+      void triggerSync();
+    }
+    window.addEventListener("online", handleOnline);
+
+    return () => {
+      unsubscribe();
+      window.removeEventListener("online", handleOnline);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hogar]);
+
+  // Con sesión activa, reintenta cada 60s (además de al abrir y tras cada evento).
+  useEffect(() => {
+    if (!hogar || !session) return;
+    const id = window.setInterval(() => void triggerSync(), 60000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hogar, !!session]);
+
   /* ---------- Cálculos en vivo (sección 5 del reporte) ---------- */
   const elapsedMin = session ? (now - session.startTs) / 60000 : 0;
   // Motor de auto-calibración por tramos (Mejora 1): ancla en la última
@@ -587,6 +654,224 @@ export default function App() {
   const batteryHealth = computeBatteryHealth(sessionsLog);
 
   /* ---------- Acciones ---------- */
+
+  /* ---------- Sincronización multi-dispositivo (Supabase) ----------
+     Regla de oro: localStorage manda siempre. Esto solo lee/escribe estado
+     ya aplicado localmente; nunca bloquea ni lanza errores visibles. */
+
+  // Acepta un hogar explícito para los llamados que ocurren en el mismo
+  // tick en que se acaba de crear/vincular (el estado de React `hogar`
+  // todavía no se actualizó ahí: setHogar es asíncrono).
+  async function triggerSync(hogarOverride?: HogarConfig) {
+    const target = hogarOverride ?? hogar;
+    if (!target) {
+      setSyncStatus({ kind: "local" });
+      return;
+    }
+    const result = await runSyncCycle(target);
+    if (result.newRemoteEvents.length > 0) applyRemoteEvents(result.newRemoteEvents);
+
+    if (result.pendingCount > 0) {
+      setSyncStatus({ kind: "pending", count: result.pendingCount });
+    } else if (result.reached) {
+      setSyncStatus({ kind: "synced", at: Date.now() });
+    }
+    // si no hay pendientes y no se alcanzó la red, se conserva el estado anterior
+  }
+
+  /* Aplica eventos remotos en orden de ts_evento sobre un estado de trabajo
+     local (evita condiciones de carrera si llega más de uno en el mismo lote). */
+  function applyRemoteEvents(events: SyncEvent[]) {
+    if (events.length === 0) return;
+    const sorted = [...events].sort((a, b) => a.ts_evento - b.ts_evento);
+
+    let workingSession = session;
+    let workingSessionsLog = sessionsLog;
+    let workingCalibrationsLog = calibrationsLog;
+    let notice: { text: string; tone: "ok" | "warn" | "err" } | null = null;
+    let didReset = false;
+
+    for (const event of sorted) {
+      if (event.tipo === "sesion_inicio") {
+        if (!workingSession) {
+          const payload = event.payload as { porcentajeInicial: number; constante: number };
+          workingSession = {
+            startTs: event.ts_evento,
+            initialPercent: payload.porcentajeInicial,
+            constant: payload.constante,
+            calibrations: [],
+          };
+          notice = { text: "Sesión iniciada desde otro teléfono.", tone: "ok" };
+        }
+      } else if (event.tipo === "calibracion") {
+        const payload = event.payload as {
+          porcentajeReal: number;
+          nuevaConstante: number;
+          tramo: string;
+          minutos: number;
+        };
+        const range = findTramoRangeByLabel(payload.tramo);
+        const remoteEntry: CalibrationLogEntry = {
+          fecha: event.ts_evento,
+          rangoBateria: range,
+          minutosDelTramo: payload.minutos,
+          constanteMedida: payload.nuevaConstante,
+          tipo: "manual",
+          origenDeviceId: event.device_id,
+        };
+        workingCalibrationsLog = [remoteEntry, ...workingCalibrationsLog].slice(0, CALIBRATIONS_LOG_MAX);
+
+        if (workingSession) {
+          const entry: Calibration = {
+            hora: fmtClock(event.ts_evento),
+            elapsedMin: Math.round((event.ts_evento - workingSession.startTs) / 60000),
+            estPercent: payload.porcentajeReal,
+            realPercent: payload.porcentajeReal,
+            deviation: 0,
+            newConstant: payload.nuevaConstante,
+            remoto: true,
+          };
+          workingSession = {
+            ...workingSession,
+            constant: payload.nuevaConstante,
+            calibrations: [entry, ...workingSession.calibrations].slice(0, 8),
+          };
+        }
+      } else if (event.tipo === "sesion_fin") {
+        const payload = event.payload as {
+          porcentajeFinal: number;
+          verificado: boolean;
+          desfase: number;
+          constanteFinal: number;
+          startTs?: number;
+          initialPercent?: number;
+          elapsedMin?: number;
+        };
+        const startTs = workingSession?.startTs ?? payload.startTs;
+        const initialPercent = workingSession?.initialPercent ?? payload.initialPercent;
+        if (startTs != null && initialPercent != null) {
+          const elapsedMinEntry = payload.elapsedMin ?? Math.round((event.ts_evento - startTs) / 60000);
+          workingSessionsLog = [
+            {
+              startTs,
+              endTs: event.ts_evento,
+              initialPercent,
+              estFinalPercent: payload.porcentajeFinal,
+              realFinalPercent: payload.porcentajeFinal,
+              deviation: payload.desfase,
+              elapsedMin: elapsedMinEntry,
+              constant: payload.constanteFinal,
+              verified: payload.verificado,
+            },
+            ...workingSessionsLog,
+          ].slice(0, SESSIONS_LOG_MAX);
+        }
+        if (workingSession && workingSession.startTs === startTs) {
+          workingSession = null;
+          notice = { text: "Sesión finalizada desde otro teléfono.", tone: "ok" };
+        }
+      } else if (event.tipo === "reset") {
+        workingSession = null;
+        workingSessionsLog = [];
+        workingCalibrationsLog = [];
+        didReset = true;
+        notice = { text: "Los datos fueron restablecidos desde otro teléfono.", tone: "warn" };
+      }
+    }
+
+    setSession(workingSession);
+    saveSession(workingSession);
+    setSessionsLog(workingSessionsLog);
+    saveSessionsLog(workingSessionsLog);
+    setCalibrationsLog(workingCalibrationsLog);
+    saveCalibrationsLog(workingCalibrationsLog);
+    if (didReset) {
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith("roccia_"))
+        .forEach((k) => localStorage.removeItem(k));
+      setHogar(null);
+    }
+    if (notice) setMsg(notice);
+  }
+
+  // Sube como eventos históricos el log de sesiones y calibraciones existentes
+  // (y la sesión en curso, si hay una) para que el otro teléfono los herede.
+  function migrateHistoryToHogar(cfg: HogarConfig, sesionActiva: Session | null) {
+    for (const s of sessionsLog) {
+      enqueueEvent(
+        cfg,
+        "sesion_fin",
+        {
+          porcentajeFinal: s.realFinalPercent,
+          verificado: s.verified,
+          desfase: s.deviation,
+          constanteFinal: s.constant,
+          startTs: s.startTs,
+          initialPercent: s.initialPercent,
+          elapsedMin: s.elapsedMin,
+        },
+        s.endTs
+      );
+    }
+    for (const c of calibrationsLog) {
+      enqueueEvent(
+        cfg,
+        "calibracion",
+        {
+          porcentajeReal: c.rangoBateria[1],
+          nuevaConstante: c.constanteMedida,
+          tramo: tramoLabelForPercent((c.rangoBateria[0] + c.rangoBateria[1]) / 2),
+          minutos: c.minutosDelTramo,
+        },
+        c.fecha
+      );
+    }
+    if (sesionActiva) {
+      enqueueEvent(
+        cfg,
+        "sesion_inicio",
+        { porcentajeInicial: sesionActiva.initialPercent, constante: sesionActiva.constant },
+        sesionActiva.startTs
+      );
+    }
+  }
+
+  function handleCreateHogar() {
+    const cfg = setupHogarNuevo();
+    setHogar(cfg);
+    migrateHistoryToHogar(cfg, session);
+    setMsg({
+      text: `Hogar creado: ${cfg.codigo}. Compártelo con el otro teléfono para vincularlo y sincronizar el historial.`,
+      tone: "ok",
+    });
+    void triggerSync(cfg);
+  }
+
+  function handleJoinHogar() {
+    const codigo = joinCodeInput.trim().toUpperCase();
+    if (!codigo) {
+      setMsg({ text: "Ingresa un código de hogar válido.", tone: "err" });
+      return;
+    }
+    const cfg = setupHogarExistente(codigo);
+    setHogar(cfg);
+    setJoinCodeInput("");
+    migrateHistoryToHogar(cfg, session);
+    setMsg({ text: `Vinculado al hogar ${cfg.codigo}. Sincronizando historial existente...`, tone: "ok" });
+    void triggerSync(cfg);
+  }
+
+  function handleCopyCode() {
+    if (!hogar) return;
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(hogar.codigo).then(
+        () => setMsg({ text: "Código copiado. Compártelo por WhatsApp con el otro teléfono.", tone: "ok" }),
+        () => setMsg({ text: `Código del hogar: ${hogar.codigo}`, tone: "ok" })
+      );
+    } else {
+      setMsg({ text: `Código del hogar: ${hogar.codigo}`, tone: "ok" });
+    }
+  }
 
   function dismissInstallBanner() {
     localStorage.setItem(KEY_INSTALL_DISMISSED, String(Date.now()));
@@ -642,6 +927,10 @@ export default function App() {
     setSession(s);
     saveSession(s);
     setStartDigitMode("none");
+    if (hogar) {
+      enqueueEvent(hogar, "sesion_inicio", { porcentajeInicial: p, constante: s.constant }, s.startTs);
+      void triggerSync();
+    }
 
     const healthNote =
       batteryHealth.status !== "collecting" && batteryHealth.health < 92
@@ -701,6 +990,23 @@ export default function App() {
       verified: true,
     });
     saveLearnedConstant(session.constant);
+    if (hogar) {
+      enqueueEvent(
+        hogar,
+        "sesion_fin",
+        {
+          porcentajeFinal: finalPercent,
+          verificado: true,
+          desfase: 0,
+          constanteFinal: constant,
+          startTs: session.startTs,
+          initialPercent: session.initialPercent,
+          elapsedMin: Math.round(stopSnapshot.elapsedMin),
+        },
+        stopSnapshot.ts
+      );
+      void triggerSync();
+    }
 
     setSession(null);
     saveSession(null);
@@ -749,6 +1055,23 @@ export default function App() {
         constant: constantUnchanged,
         verified: false,
       });
+      if (hogar) {
+        enqueueEvent(
+          hogar,
+          "sesion_fin",
+          {
+            porcentajeFinal: real,
+            verificado: false,
+            desfase: deviation,
+            constanteFinal: constantUnchanged,
+            startTs: session.startTs,
+            initialPercent: session.initialPercent,
+            elapsedMin: elapsedMinRounded,
+          },
+          stopSnapshot.ts
+        );
+        void triggerSync();
+      }
       setSession(null);
       saveSession(null);
       setStopSnapshot(null);
@@ -789,6 +1112,36 @@ export default function App() {
         constanteMedida: segment.constanteMedida,
         tipo: "cierre",
       });
+      if (hogar) {
+        enqueueEvent(
+          hogar,
+          "calibracion",
+          {
+            porcentajeReal: real,
+            nuevaConstante: segment.constanteMedida,
+            tramo: tramoLabelForPercent((segment.rangoBateria[0] + segment.rangoBateria[1]) / 2),
+            minutos: segment.minutosDelTramo,
+          },
+          stopSnapshot.ts
+        );
+      }
+    }
+    if (hogar) {
+      enqueueEvent(
+        hogar,
+        "sesion_fin",
+        {
+          porcentajeFinal: real,
+          verificado: false,
+          desfase: deviation,
+          constanteFinal: newConstantRounded,
+          startTs: session.startTs,
+          initialPercent: session.initialPercent,
+          elapsedMin: elapsedMinRounded,
+        },
+        stopSnapshot.ts
+      );
+      void triggerSync();
     }
 
     setSession(null);
@@ -862,6 +1215,15 @@ export default function App() {
         constanteMedida: segment.constanteMedida,
         tipo: "manual",
       });
+      if (hogar) {
+        enqueueEvent(hogar, "calibracion", {
+          porcentajeReal: real,
+          nuevaConstante: segment.constanteMedida,
+          tramo: tramoLabelForPercent((segment.rangoBateria[0] + segment.rangoBateria[1]) / 2),
+          minutos: segment.minutosDelTramo,
+        });
+        void triggerSync();
+      }
     }
 
     if (Math.abs(deviation) < 0.5) {
@@ -884,12 +1246,32 @@ export default function App() {
 
   /* Borra toda clave con prefijo "roccia_" (sesión, constante aprendida,
      log de sesiones, marca del banner de instalación, y cualquier futura). */
-  function handleFactoryReset() {
+  async function handleFactoryReset() {
+    // Aviso best-effort a los otros teléfonos antes de borrar el emparejamiento
+    // local (la cola/outbox también se va a borrar, así que no tiene caso encolarlo).
+    if (hogar) {
+      try {
+        const { error } = await supabase.from("eventos").insert({
+          id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          hogar_codigo: hogar.codigo,
+          device_id: hogar.deviceId,
+          tipo: "reset",
+          ts_evento: Date.now(),
+          payload: {},
+        });
+        if (error) console.error("[sync] fallo al avisar el reset a Supabase:", error);
+      } catch (err) {
+        // sin conexión: el otro teléfono simplemente no se entera de este reset
+        console.error("[sync] excepción al avisar el reset a Supabase (sin conexión?):", err);
+      }
+    }
     Object.keys(localStorage)
       .filter((k) => k.startsWith("roccia_"))
       .forEach((k) => localStorage.removeItem(k));
     setSessionsLog([]);
     setCalibrationsLog([]);
+    setHogar(null);
+    setSyncStatus({ kind: "local" });
     setShowResetConfirm(false);
     setMsg({
       text: "Datos restablecidos. El sistema vuelve a la constante de fábrica 5.89 min/%",
@@ -942,6 +1324,25 @@ export default function App() {
           <span style={S.brand}>ROCCIA MONITOR</span>
           <span style={{ fontSize: 12, color: C.muted }}>
             30,000 mAh · {CAPACITY_WH} Wh
+          </span>
+        </div>
+
+        {/* ===== INDICADOR DE SINCRONIZACIÓN ===== */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 4px 12px", fontSize: 11 }}>
+          <span
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: "50%",
+              display: "inline-block",
+              background: syncStatus.kind === "synced" ? C.lcd : syncStatus.kind === "pending" ? C.amber : C.muted,
+            }}
+          />
+          <span style={{ color: C.muted }}>
+            {syncStatus.kind === "synced" && `Sincronizado ${fmtClock(syncStatus.at)}`}
+            {syncStatus.kind === "pending" &&
+              `${syncStatus.count} evento${syncStatus.count === 1 ? "" : "s"} pendiente${syncStatus.count === 1 ? "" : "s"}`}
+            {syncStatus.kind === "local" && "Solo local"}
           </span>
         </div>
 
@@ -1161,7 +1562,10 @@ export default function App() {
                 </div>
                 {session.calibrations.map((c, i) => (
                   <div key={i} style={S.histRow}>
-                    <span>{c.hora}</span>
+                    <span>
+                      {c.hora}
+                      {c.remoto ? " ↔" : ""}
+                    </span>
                     <span>
                       {c.estPercent}% → {c.realPercent}%
                     </span>
@@ -1270,6 +1674,60 @@ export default function App() {
         <div style={{ fontSize: 11.5, color: C.muted, textAlign: "center", marginTop: 20 }}>
           ONU VSOL + TP-Link Archer AX10 · cables boost 5V→12V · base empírica: 277 min
         </div>
+
+        {/* ===== SINCRONIZACIÓN ===== */}
+        {!session && (
+          <div style={S.section}>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>Sincronización</div>
+            {hogar ? (
+              <>
+                <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 10 }}>
+                  Este teléfono está vinculado al hogar. Toca el código para copiarlo y
+                  compartirlo por WhatsApp con el otro teléfono.
+                </div>
+                <div
+                  style={{ ...S.input, cursor: "pointer", letterSpacing: 1 }}
+                  onClick={handleCopyCode}
+                >
+                  {hogar.codigo}
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 10 }}>
+                  Vincula este teléfono con otro para compartir el monitoreo y el aprendizaje
+                  de la batería. Sin código configurado, la app sigue funcionando 100% local.
+                </div>
+                <div style={S.btnRow}>
+                  <button
+                    style={{ ...S.btn, background: C.green, color: C.greenDark }}
+                    onClick={handleCreateHogar}
+                  >
+                    Crear código de hogar
+                  </button>
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, margin: "12px 0 6px", textAlign: "center" }}>
+                  o ingresa un código existente
+                </div>
+                <input
+                  style={S.input}
+                  type="text"
+                  placeholder="ROCCIA-XXXX"
+                  value={joinCodeInput}
+                  onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
+                />
+                <div style={S.btnRow}>
+                  <button
+                    style={{ ...S.btn, background: C.card, color: C.text, border: `1px solid ${C.border}` }}
+                    onClick={handleJoinHogar}
+                  >
+                    Vincular
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
 
         {/* ===== RESTABLECER DATOS DE FÁBRICA ===== */}
         {!session && (
