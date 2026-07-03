@@ -6,9 +6,11 @@ const KEY_SESSION = "roccia_session_v1";
 const KEY_CONSTANT = "roccia_constant_v1"; // constante aprendida (memoria entre sesiones)
 const KEY_SESSIONS_LOG = "roccia_sessions_log_v1"; // historial de cierres verificados
 const KEY_INSTALL_DISMISSED = "roccia_install_dismissed_v1"; // timestamp del último "no ahora"
+const KEY_CALIBRATIONS_LOG = "roccia_calibrations_log_v1"; // mediciones por tramo (motor de auto-calibración)
 const DEFAULT_CONSTANT = 5.89; // minutos por 1% (dato empírico del reporte)
 const CAPACITY_WH = 111; // Roccia 30,000 mAh @ 3.7V
 const SESSIONS_LOG_MAX = 20;
+const CALIBRATIONS_LOG_MAX = 100;
 const BASELINE = 5.89; // constante de referencia por defecto para la salud de la batería
 const HEALTH_MIN_SESSION_MIN = 60; // duración mínima para que una sesión cuente como "válida"
 const HEALTH_SAMPLE_SIZE = 3; // cuántas sesiones válidas se promedian para cada extremo
@@ -48,6 +50,20 @@ type SessionLogEntry = {
   verified: boolean; // true = el estimado coincidió con el real ("SÍ, coincide")
 };
 
+// Cada entrada representa un tramo independiente de la curva de descarga:
+// desde la última medición (calibración manual o cierre) hasta la actual.
+type CalibrationLogEntry = {
+  fecha: number;
+  rangoBateria: [number, number]; // [% al inicio del tramo, % al final del tramo]
+  minutosDelTramo: number;
+  constanteMedida: number;
+  tipo: "manual" | "cierre";
+};
+
+// Corrección de "dígito recién cambiado": el display del power bank solo
+// muestra enteros, así que el valor real puede estar hasta 0.99 por debajo.
+type DigitMode = "none" | "just_changed" | "unknown";
+
 function loadSession(): Session | null {
   try {
     const raw = localStorage.getItem(KEY_SESSION);
@@ -77,6 +93,17 @@ function loadSessionsLog(): SessionLogEntry[] {
 }
 function saveSessionsLog(log: SessionLogEntry[]) {
   localStorage.setItem(KEY_SESSIONS_LOG, JSON.stringify(log.slice(0, SESSIONS_LOG_MAX)));
+}
+function loadCalibrationsLog(): CalibrationLogEntry[] {
+  try {
+    const raw = localStorage.getItem(KEY_CALIBRATIONS_LOG);
+    return raw ? (JSON.parse(raw) as CalibrationLogEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+function saveCalibrationsLog(log: CalibrationLogEntry[]) {
+  localStorage.setItem(KEY_CALIBRATIONS_LOG, JSON.stringify(log.slice(0, CALIBRATIONS_LOG_MAX)));
 }
 
 /* ================= DETECCIÓN DE DESGASTE DE LA BATERÍA ================= */
@@ -113,6 +140,188 @@ function computeBatteryHealth(log: SessionLogEntry[]): BatteryHealth {
   return { status, health, referenceConstant, currentConstant };
 }
 
+/* ================= MOTOR DE AUTO-CALIBRACIÓN POR TRAMOS ================= */
+
+// Tramos de batería [inicio, fin], de mayor a menor porcentaje.
+const TRAMOS: Array<[number, number]> = [
+  [100, 90],
+  [90, 70],
+  [70, 40],
+  [40, 0],
+];
+const TRAMO_MIN_MEASUREMENTS = 2; // por debajo de esto, "modo básico" (sin tramos)
+const TRAMO_RECENT_COUNT = 10; // las últimas N mediciones pesan doble
+
+type TramoModel = { range: [number, number]; constant: number }[];
+
+function tramoIndexForPercent(p: number): number {
+  if (p > 90) return 0;
+  if (p > 70) return 1;
+  if (p > 40) return 2;
+  return 3;
+}
+
+/* Media ponderada de las mediciones que caen en el tramo: peso = minutos del
+   tramo, y las últimas TRAMO_RECENT_COUNT mediciones del log (global, no por
+   tramo) pesan doble. Si el tramo no tiene mediciones, usa el fallback. */
+function computeTramoConstant(log: CalibrationLogEntry[], tramoIdx: number, fallback: number): number {
+  const recentSet = new Set(log.slice(0, TRAMO_RECENT_COUNT).map((e) => e.fecha));
+  const entries = log.filter(
+    (e) => tramoIndexForPercent((e.rangoBateria[0] + e.rangoBateria[1]) / 2) === tramoIdx
+  );
+  if (entries.length === 0) return fallback;
+
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (const e of entries) {
+    let weight = Math.max(e.minutosDelTramo, 1);
+    if (recentSet.has(e.fecha)) weight *= 2;
+    weightedSum += weight * e.constanteMedida;
+    weightTotal += weight;
+  }
+  return weightedSum / weightTotal;
+}
+
+function buildTramoModel(log: CalibrationLogEntry[], globalConstant: number): TramoModel {
+  return TRAMOS.map((range, idx) => ({
+    range,
+    constant: computeTramoConstant(log, idx, globalConstant),
+  }));
+}
+
+/* Constante del tramo desde la última medición (calibración manual o cierre)
+   hasta la actual: constante_tramo = minutos_del_tramo / %_consumido_del_tramo.
+   Devuelve null si el tramo no es válido (sin tiempo o consumo positivo). */
+function computeSegmentFromLastAnchor(
+  sess: Session,
+  currentElapsedMin: number,
+  currentRealPercent: number
+): { rangoBateria: [number, number]; minutosDelTramo: number; constanteMedida: number } | null {
+  const lastCal = sess.calibrations[0];
+  const anchorPercent = lastCal ? lastCal.realPercent : sess.initialPercent;
+  const anchorElapsedMin = lastCal ? lastCal.elapsedMin : 0;
+
+  const minutosDelTramo = currentElapsedMin - anchorElapsedMin;
+  const percentConsumed = anchorPercent - currentRealPercent;
+  if (minutosDelTramo <= 0 || percentConsumed <= 0) return null;
+
+  return {
+    rangoBateria: [anchorPercent, currentRealPercent],
+    minutosDelTramo: Math.round(minutosDelTramo),
+    constanteMedida: minutosDelTramo / percentConsumed,
+  };
+}
+
+/* Proyecta el % de batería avanzando tramo por tramo desde un punto de anclaje,
+   cambiando de constante automáticamente al cruzar cada límite de tramo. */
+function estimatePercentAndConstant(
+  anchorPercent: number,
+  minutesElapsedSinceAnchor: number,
+  tramoModel: TramoModel
+): { percent: number; constant: number; tramoLabel: string } {
+  let percent = anchorPercent;
+  let remaining = minutesElapsedSinceAnchor;
+  let idx = tramoIndexForPercent(percent);
+  let activeConstant = tramoModel[idx].constant;
+  let activeLabel = `${tramoModel[idx].range[0]}-${tramoModel[idx].range[1]}%`;
+
+  while (remaining > 0 && percent > 0) {
+    idx = tramoIndexForPercent(percent);
+    const { constant, range } = tramoModel[idx];
+    activeConstant = constant;
+    activeLabel = `${range[0]}-${range[1]}%`;
+
+    const tramoFloor = range[1];
+    const percentAvailable = percent - tramoFloor;
+    const minutesToExhaustTramo = percentAvailable * constant;
+
+    if (percentAvailable > 0 && remaining >= minutesToExhaustTramo) {
+      remaining -= minutesToExhaustTramo;
+      percent = tramoFloor;
+      if (idx === TRAMOS.length - 1) break; // llegó a 0%
+    } else {
+      percent -= remaining / constant;
+      remaining = 0;
+    }
+  }
+
+  return { percent: clamp(percent, 0, 100), constant: activeConstant, tramoLabel: activeLabel };
+}
+
+/* Autonomía restante sumando minuto a minuto (tramo por tramo) desde el %
+   actual hasta 0, usando la constante propia de cada tramo. */
+function remainingMinutesFromPercent(percent: number, tramoModel: TramoModel): number {
+  let p = percent;
+  let totalMinutes = 0;
+  while (p > 0) {
+    const idx = tramoIndexForPercent(p);
+    const { constant, range } = tramoModel[idx];
+    const tramoFloor = range[1];
+    totalMinutes += (p - tramoFloor) * constant;
+    p = tramoFloor;
+    if (idx === TRAMOS.length - 1) break;
+  }
+  return totalMinutes;
+}
+
+type LiveEstimate = {
+  percent: number;
+  remainingMin: number;
+  activeConstant: number;
+  tramoLabel: string | null; // null en "modo básico"
+  mode: "tramos" | "basico";
+};
+
+/* Punto de entrada del motor: con menos de 2 mediciones en el log usa la
+   lógica plana de siempre (anclada al inicio de sesión). Con 2 o más, ancla
+   en la última calibración manual de la sesión (o el inicio si no hay) y
+   proyecta con el modelo por tramos, recalculado en cada render. */
+function computeLiveEstimate(
+  sess: Session,
+  elapsedMinTotal: number,
+  calibrationsLog: CalibrationLogEntry[]
+): LiveEstimate {
+  if (calibrationsLog.length < TRAMO_MIN_MEASUREMENTS) {
+    const lost = elapsedMinTotal / sess.constant;
+    const percent = clamp(sess.initialPercent - lost, 0, 100);
+    return {
+      percent,
+      remainingMin: percent * sess.constant,
+      activeConstant: sess.constant,
+      tramoLabel: null,
+      mode: "basico",
+    };
+  }
+
+  const tramoModel = buildTramoModel(calibrationsLog, sess.constant);
+  const lastCal = sess.calibrations[0];
+  const anchorPercent = lastCal ? lastCal.realPercent : sess.initialPercent;
+  const anchorElapsedMin = lastCal ? lastCal.elapsedMin : 0;
+  const minutesSinceAnchor = Math.max(0, elapsedMinTotal - anchorElapsedMin);
+
+  const { percent, constant, tramoLabel } = estimatePercentAndConstant(
+    anchorPercent,
+    minutesSinceAnchor,
+    tramoModel
+  );
+
+  return {
+    percent,
+    remainingMin: remainingMinutesFromPercent(percent, tramoModel),
+    activeConstant: constant,
+    tramoLabel,
+    mode: "tramos",
+  };
+}
+
+/* Corrección de "dígito recién cambiado": el display entero "75" puede ser
+   cualquier valor real entre 75.0 y 75.99. */
+function applyDigitCorrection(rawValue: number, mode: DigitMode, skipAt100 = false): number {
+  if (mode === "none") return rawValue;
+  if (skipAt100 && rawValue >= 100) return rawValue;
+  return mode === "just_changed" ? rawValue + 0.99 : rawValue + 0.5;
+}
+
 /* ================= UTILIDADES ================= */
 
 function fmtHM(totalMin: number): string {
@@ -137,6 +346,16 @@ function fmtDateShort(ts: number): string {
 function isStandaloneMode(): boolean {
   const iosStandalone = (navigator as unknown as { standalone?: boolean }).standalone === true;
   return window.matchMedia("(display-mode: standalone)").matches || iosStandalone;
+}
+function fmtFinishTime(nowTs: number, remainingMin: number): string {
+  const now = new Date(nowTs);
+  const finish = new Date(nowTs + remainingMin * 60000);
+  const sameDay =
+    finish.getFullYear() === now.getFullYear() &&
+    finish.getMonth() === now.getMonth() &&
+    finish.getDate() === now.getDate();
+  const hm = finish.toLocaleTimeString("es-VE", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return sameDay ? hm : `mañana ${hm}`;
 }
 
 /* ================= ESTILOS ================= */
@@ -260,6 +479,38 @@ const S: Record<string, React.CSSProperties> = {
   },
 };
 
+/* Par de botones toggle (mutuamente excluyentes) para la corrección de
+   "dígito recién cambiado". Se reutiliza en START, CALIBRAR y STOP/corregir. */
+function DigitCorrectionToggle({ mode, onChange }: { mode: DigitMode; onChange: (m: DigitMode) => void }) {
+  const optionStyle = (active: boolean): React.CSSProperties => ({
+    ...S.btn,
+    padding: "10px 4px",
+    fontSize: 11.5,
+    lineHeight: 1.3,
+    background: active ? C.green : C.lcdDim,
+    color: active ? C.greenDark : C.muted,
+    border: `1px solid ${active ? C.green : C.border}`,
+  });
+  return (
+    <div style={{ display: "flex", gap: 8, marginTop: 8, marginBottom: 4 }}>
+      <button
+        type="button"
+        style={optionStyle(mode === "just_changed")}
+        onClick={() => onChange(mode === "just_changed" ? "none" : "just_changed")}
+      >
+        Acabo de ver el dígito cambiar
+      </button>
+      <button
+        type="button"
+        style={optionStyle(mode === "unknown")}
+        onClick={() => onChange(mode === "unknown" ? "none" : "unknown")}
+      >
+        No sé cuándo cambió
+      </button>
+    </div>
+  );
+}
+
 /* ================= COMPONENTE PRINCIPAL ================= */
 
 export default function App() {
@@ -269,6 +520,10 @@ export default function App() {
   const [calibInput, setCalibInput] = useState("");
   const [msg, setMsg] = useState<{ text: string; tone: "ok" | "warn" | "err" } | null>(null);
   const [sessionsLog, setSessionsLog] = useState<SessionLogEntry[]>(() => loadSessionsLog());
+  const [calibrationsLog, setCalibrationsLog] = useState<CalibrationLogEntry[]>(() => loadCalibrationsLog());
+  const [startDigitMode, setStartDigitMode] = useState<DigitMode>("none");
+  const [calibDigitMode, setCalibDigitMode] = useState<DigitMode>("none");
+  const [stopDigitMode, setStopDigitMode] = useState<DigitMode>("none");
 
   // Snapshot tomado al presionar STOP: congela el estimado y los minutos
   // transcurridos mientras el usuario decide en el panel de cierre.
@@ -321,9 +576,12 @@ export default function App() {
 
   /* ---------- Cálculos en vivo (sección 5 del reporte) ---------- */
   const elapsedMin = session ? (now - session.startTs) / 60000 : 0;
-  const lost = session ? elapsedMin / session.constant : 0;
-  const estPercent = session ? clamp(session.initialPercent - lost, 0, 100) : 0;
-  const remainingMin = session ? estPercent * session.constant : 0;
+  // Motor de auto-calibración por tramos (Mejora 1): ancla en la última
+  // calibración de la sesión y usa la constante del tramo activo. Con menos
+  // de 2 mediciones en el log global, cae en "modo básico" (lógica anterior).
+  const liveEstimate = session ? computeLiveEstimate(session, elapsedMin, calibrationsLog) : null;
+  const estPercent = liveEstimate ? liveEstimate.percent : 0;
+  const remainingMin = liveEstimate ? liveEstimate.remainingMin : 0;
   const watts = session ? (CAPACITY_WH * (60 / session.constant)) / 100 : 0;
   const percentPerHour = session ? 60 / session.constant : 0;
   const batteryHealth = computeBatteryHealth(sessionsLog);
@@ -369,11 +627,12 @@ export default function App() {
   }
 
   function handleStart() {
-    const p = parseFloat(initialInput);
-    if (!Number.isFinite(p) || p <= 0 || p > 100) {
+    const pRaw = parseFloat(initialInput);
+    if (!Number.isFinite(pRaw) || pRaw <= 0 || pRaw > 100) {
       setMsg({ text: "Ingresa un porcentaje inicial válido (1 – 100).", tone: "err" });
       return;
     }
+    const p = applyDigitCorrection(pRaw, startDigitMode, true); // 100% no se corrige
     const s: Session = {
       startTs: Date.now(),
       initialPercent: p,
@@ -382,6 +641,7 @@ export default function App() {
     };
     setSession(s);
     saveSession(s);
+    setStartDigitMode("none");
 
     const healthNote =
       batteryHealth.status !== "collecting" && batteryHealth.health < 92
@@ -398,12 +658,20 @@ export default function App() {
     setStopSnapshot({ ts: Date.now(), elapsedMin, estPercent });
     setStopStage("confirm");
     setStopCorrectInput("");
+    setStopDigitMode("none");
   }
 
   function handleStopCancel() {
     setStopSnapshot(null);
     setStopStage("confirm");
     setStopCorrectInput("");
+    setStopDigitMode("none");
+  }
+
+  function recordCalibrationLog(entry: CalibrationLogEntry) {
+    const updated = [entry, ...loadCalibrationsLog()].slice(0, CALIBRATIONS_LOG_MAX);
+    saveCalibrationsLog(updated);
+    setCalibrationsLog(updated);
   }
 
   function recordSessionLog(entry: SessionLogEntry) {
@@ -452,14 +720,15 @@ export default function App() {
      el % real congelados en el snapshot de STOP. */
   function handleStopConfirmCorrect() {
     if (!session || !stopSnapshot) return;
-    const real = parseFloat(stopCorrectInput);
-    if (!Number.isFinite(real) || real < 0 || real > session.initialPercent) {
+    const realRaw = parseFloat(stopCorrectInput);
+    if (!Number.isFinite(realRaw) || realRaw < 0 || realRaw > session.initialPercent) {
       setMsg({
         text: `Ingresa el % real que muestra el power bank (entre 0 y ${session.initialPercent}).`,
         tone: "err",
       });
       return;
     }
+    const real = applyDigitCorrection(realRaw, stopDigitMode, true);
 
     const consumed = session.initialPercent - real;
     const deviation = Math.round((stopSnapshot.estPercent - real) * 10) / 10;
@@ -484,6 +753,7 @@ export default function App() {
       saveSession(null);
       setStopSnapshot(null);
       setCalibInput("");
+      setStopDigitMode("none");
       setMsg({
         text: `Datos insuficientes para ajustar la constante (mínimo 5 minutos y 1% de consumo real). Sesión finalizada y registro guardado sin modificar la constante.${
           suddenDrop ? ` ${suddenDrop}` : ""
@@ -496,6 +766,8 @@ export default function App() {
     const newConstant = stopSnapshot.elapsedMin / consumed; // misma fórmula del reporte
     const newConstantRounded = Math.round(newConstant * 100) / 100;
     const suddenDrop = buildSuddenDropWarning(newConstantRounded);
+    // Registro de tramo para el motor de auto-calibración (no afecta session.constant).
+    const segment = computeSegmentFromLastAnchor(session, stopSnapshot.elapsedMin, real);
 
     recordSessionLog({
       startTs: session.startTs,
@@ -509,11 +781,21 @@ export default function App() {
       verified: false,
     });
     saveLearnedConstant(newConstant); // memoria permanente entre sesiones
+    if (segment) {
+      recordCalibrationLog({
+        fecha: Date.now(),
+        rangoBateria: segment.rangoBateria,
+        minutosDelTramo: segment.minutosDelTramo,
+        constanteMedida: segment.constanteMedida,
+        tipo: "cierre",
+      });
+    }
 
     setSession(null);
     saveSession(null);
     setStopSnapshot(null);
     setCalibInput("");
+    setStopDigitMode("none");
 
     const dir = deviation > 0 ? "adelantada" : "atrasada";
     setMsg({
@@ -530,14 +812,15 @@ export default function App() {
      la constante en la sesión Y en la memoria permanente. */
   function handleCalibrate() {
     if (!session) return;
-    const real = parseFloat(calibInput);
-    if (!Number.isFinite(real) || real < 0 || real > session.initialPercent) {
+    const realRaw = parseFloat(calibInput);
+    if (!Number.isFinite(realRaw) || realRaw < 0 || realRaw > session.initialPercent) {
       setMsg({
         text: `Ingresa el % real que muestra el power bank (entre 0 y ${session.initialPercent}).`,
         tone: "err",
       });
       return;
     }
+    const real = applyDigitCorrection(realRaw, calibDigitMode, true);
     const consumed = session.initialPercent - real;
     if (elapsedMin < 5 || consumed < 1) {
       setMsg({
@@ -549,6 +832,8 @@ export default function App() {
 
     const newConstant = elapsedMin / consumed; // fórmula del reporte
     const deviation = estPercent - real; // + = la app iba adelantada (optimista)
+    // Registro de tramo para el motor de auto-calibración (no afecta session.constant).
+    const segment = computeSegmentFromLastAnchor(session, elapsedMin, real);
 
     const entry: Calibration = {
       hora: fmtClock(Date.now()),
@@ -568,6 +853,16 @@ export default function App() {
     saveSession(updated);
     saveLearnedConstant(newConstant); // memoria permanente entre sesiones
     setCalibInput("");
+    setCalibDigitMode("none");
+    if (segment) {
+      recordCalibrationLog({
+        fecha: Date.now(),
+        rangoBateria: segment.rangoBateria,
+        minutosDelTramo: segment.minutosDelTramo,
+        constanteMedida: segment.constanteMedida,
+        tipo: "manual",
+      });
+    }
 
     if (Math.abs(deviation) < 0.5) {
       setMsg({
@@ -594,6 +889,7 @@ export default function App() {
       .filter((k) => k.startsWith("roccia_"))
       .forEach((k) => localStorage.removeItem(k));
     setSessionsLog([]);
+    setCalibrationsLog([]);
     setShowResetConfirm(false);
     setMsg({
       text: "Datos restablecidos. El sistema vuelve a la constante de fábrica 5.89 min/%",
@@ -671,8 +967,16 @@ export default function App() {
           </div>
         </div>
 
+        {/* ===== HORA ESTIMADA DE FIN ===== */}
+        {session && liveEstimate && (
+          <div style={{ ...S.metric, marginTop: 14 }}>
+            <div style={S.metricLabel}>Batería agotada a las</div>
+            <div style={S.metricValue}>{fmtFinishTime(now, liveEstimate.remainingMin)}</div>
+          </div>
+        )}
+
         {/* ===== MÉTRICAS ===== */}
-        {session && (
+        {session && liveEstimate && (
           <div style={S.grid}>
             <div style={S.metric}>
               <div style={S.metricLabel}>Autonomía restante</div>
@@ -680,7 +984,10 @@ export default function App() {
             </div>
             <div style={S.metric}>
               <div style={S.metricLabel}>Ritmo actual</div>
-              <div style={S.metricValue}>{session.constant.toFixed(2)} m/%</div>
+              <div style={S.metricValue}>{liveEstimate.activeConstant.toFixed(2)} m/%</div>
+              <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>
+                {liveEstimate.mode === "tramos" ? `auto-ajuste: tramo ${liveEstimate.tramoLabel}` : "modo básico"}
+              </div>
             </div>
             <div style={S.metric}>
               <div style={S.metricLabel}>Inicio de sesión</div>
@@ -716,6 +1023,7 @@ export default function App() {
               value={initialInput}
               onChange={(e) => setInitialInput(e.target.value)}
             />
+            <DigitCorrectionToggle mode={startDigitMode} onChange={setStartDigitMode} />
             <div style={S.btnRow}>
               <button
                 style={{ ...S.btn, background: C.green, color: C.greenDark }}
@@ -783,6 +1091,7 @@ export default function App() {
                       value={stopCorrectInput}
                       onChange={(e) => setStopCorrectInput(e.target.value)}
                     />
+                    <DigitCorrectionToggle mode={stopDigitMode} onChange={setStopDigitMode} />
                     <div style={S.btnRow}>
                       <button
                         style={{ ...S.btn, background: C.green, color: C.greenDark }}
@@ -820,6 +1129,7 @@ export default function App() {
                   value={calibInput}
                   onChange={(e) => setCalibInput(e.target.value)}
                 />
+                <DigitCorrectionToggle mode={calibDigitMode} onChange={setCalibDigitMode} />
                 <div style={S.btnRow}>
                   <button
                     style={{ ...S.btn, background: C.card, color: C.text, border: `1px solid ${C.border}` }}
